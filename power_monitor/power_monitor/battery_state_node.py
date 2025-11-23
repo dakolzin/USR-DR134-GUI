@@ -18,6 +18,40 @@ def crc16(data: bytes) -> bytes:
                 crc >>= 1
     return bytes([crc & 0xFF, (crc >> 8) & 0xFF])
 
+def voltage_to_soc(voltage: float) -> float:
+    """
+    Приблизительный SOC для 6S Li-ion по напряжению (0..1).
+    Таблица точек + линейная интерполяция.
+    """
+    points = [
+        (25.2, 1.00),
+        (24.3, 0.90),
+        (23.7, 0.80),
+        (23.1, 0.70),
+        (22.8, 0.60),
+        (22.5, 0.50),
+        (22.2, 0.40),
+        (21.9, 0.30),
+        (21.3, 0.20),
+        (20.7, 0.10),
+        (19.8, 0.00),
+    ]
+
+    if voltage >= points[0][0]:
+        return 1.0
+    if voltage <= points[-1][0]:
+        return 0.0
+
+    for i in range(len(points) - 1):
+        v1, s1 = points[i]
+        v2, s2 = points[i + 1]
+        if v1 >= voltage >= v2:
+            # линейная интерполяция между v1 и v2
+            k = (v1 - voltage) / (v1 - v2)
+            return s1 + (s2 - s1) * k
+
+    return 0.0
+
 def make_req(addr: int) -> bytes:
     # slave = 1, func = 0x04, count = 1
     pdu = bytes([
@@ -53,29 +87,38 @@ class BatteryMonitor(Node):
 
     def update(self):
         try:
+            # Напряжение
             voltage_mv = read_reg(0x000E)
+            voltage = voltage_mv / 1000.0
 
+            # Ток
             current_raw = read_reg(0x000F)
             if current_raw >= 0x8000:
                 current_raw -= 0x10000
+            current_a = current_raw / 1000.0
 
-            soc_raw = read_reg(0x0012)
-            soc = soc_raw / 10.0
+            # Можем читать сырой SOC, но только для логов (не для процента)
+            # soc_raw = read_reg(0x0012)
+            # soc_reg = soc_raw / 10.0
+
+            # Оценка SOC по напряжению
+            soc_est = voltage_to_soc(voltage)  # 0..1
 
             msg = BatteryState()
-            msg.voltage = voltage_mv / 1000.0
-            msg.current = current_raw / 1000.0   # A
-            msg.percentage = min(soc / 100.0, 1.0)  # 0..1
+            msg.voltage = voltage
+            msg.current = current_a
+            msg.percentage = soc_est       # <-- используем только по напряжению
             msg.present = True
-
-            # msg.design_capacity = 20.0
 
             self.pub.publish(msg)
 
-            #self.get_logger().info(f"Voltage: {msg.voltage:.3f} V, Current: {msg.current:.3f} A")
+            # можно логировать, если нужно
+            # self.get_logger().info(
+            #     f"U={voltage:.3f} V, I={current_a:.3f} A, SOC≈{soc_est*100:.1f}%"
+            # )
 
-            # простое оповещение по порогу 18 В
-            if msg.voltage < 18.0:
+            # порог по напряжению
+            if msg.voltage < 21.0:
                 self.get_logger().warn(f"LOW BATTERY: {msg.voltage:.2f} V")
 
         except Exception as e:
